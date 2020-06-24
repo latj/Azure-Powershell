@@ -18,6 +18,7 @@ Param(
 # The resource will be placed in a resource group with the same name as at source
 # The script will check if the VM is in an AS and create one if not exist in the new rg an add the VM to it.
 # The Disk will be copied to the new subscription the source disk will not be deleted
+# VMs in Zones can't be moved by this script
 
 # ----------------------------------------------------------
 
