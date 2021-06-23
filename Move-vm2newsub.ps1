@@ -92,9 +92,12 @@ if ((Get-AzContext).Subscription.Name -ne $TargetSubscriptionName){
 # import the configs from the json files
 Write-Output ('[{0}] Importing configurations from file ' -f (Get-Date -Format s))
 $orginalVM= Get-Content -Raw -Path "$home\$($vmName).json" | ConvertFrom-Json
-$as= Get-Content -Raw -Path "$home\$($res.Name).json" | ConvertFrom-Json
+# checking if as is used and import that config
+if ($orginalVM.AvailabilitySetReference.Id){
+   $as= Get-Content -Raw -Path "$home\$($res.Name).json" | ConvertFrom-Json
+}
 
-# chiecking if Rg exists
+# checking if Rg exists
 Try {Get-AzResourceGroup -Name $resourceGroup -ErrorAction Stop | Out-Null}
 Catch {#
     Write-Output ('[{0}] Resource Group does not exist in targetSubscription it will be created.' -f (Get-Date -Format s))
