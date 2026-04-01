@@ -14,6 +14,11 @@ INTERVAL="PT1M"
 OUT_DIR="."
 PREFIX="vmss_metrics"
 
+bytes_to_mb() {
+    local bytes="$1"
+    jq -nr --argjson b "$bytes" '($b / 1048576)'
+}
+
 safe_exit() {
     local code="${1:-1}"
     # If sourced, return to prompt instead of closing the shell session.
@@ -154,7 +159,7 @@ if [[ -z "$INSTANCE_IDS" ]]; then
     safe_exit 1
 fi
 
-echo "instanceId,networkInBytes,networkOutBytes,totalBytes" > "$CSV_FILE"
+echo "instanceId,networkInBytes,networkOutBytes,totalBytes,networkInMB,networkOutMB,totalMB" > "$CSV_FILE"
 
 echo "Collecting network traffic metrics per instance..."
 for INSTANCE_ID in $INSTANCE_IDS; do
@@ -184,15 +189,22 @@ for INSTANCE_ID in $INSTANCE_IDS; do
         continue
     fi
 
+    NET_IN_MB=$(bytes_to_mb "$NET_IN")
+    NET_OUT_MB=$(bytes_to_mb "$NET_OUT")
+    TOTAL_MB=$(bytes_to_mb "$TOTAL")
+
     jq -n \
         --arg instanceId "$INSTANCE_ID" \
         --argjson networkInBytes "$NET_IN" \
         --argjson networkOutBytes "$NET_OUT" \
         --argjson totalBytes "$TOTAL" \
-        '{instanceId:$instanceId, networkInBytes:$networkInBytes, networkOutBytes:$networkOutBytes, totalBytes:$totalBytes}' >> "$TMP_FILE"
+        --argjson networkInMB "$NET_IN_MB" \
+        --argjson networkOutMB "$NET_OUT_MB" \
+        --argjson totalMB "$TOTAL_MB" \
+        '{instanceId:$instanceId, networkInBytes:$networkInBytes, networkOutBytes:$networkOutBytes, totalBytes:$totalBytes, networkInMB:$networkInMB, networkOutMB:$networkOutMB, totalMB:$totalMB}' >> "$TMP_FILE"
 
-    printf '%s,%s,%s,%s\n' "$INSTANCE_ID" "$NET_IN" "$NET_OUT" "$TOTAL" >> "$CSV_FILE"
-    echo "Instance $INSTANCE_ID: IN=$NET_IN, OUT=$NET_OUT, TOTAL=$TOTAL bytes"
+    printf '%s,%s,%s,%s,%.6f,%.6f,%.6f\n' "$INSTANCE_ID" "$NET_IN" "$NET_OUT" "$TOTAL" "$NET_IN_MB" "$NET_OUT_MB" "$TOTAL_MB" >> "$CSV_FILE"
+    printf 'Instance %s: IN=%s bytes (%.2f MB), OUT=%s bytes (%.2f MB), TOTAL=%s bytes (%.2f MB)\n' "$INSTANCE_ID" "$NET_IN" "$NET_IN_MB" "$NET_OUT" "$NET_OUT_MB" "$TOTAL" "$TOTAL_MB"
 done
 
 if ! jq -s '.' "$TMP_FILE" > "$JSON_FILE"; then
@@ -202,7 +214,11 @@ fi
 
 echo
 echo "=== Traffic Comparison (Highest to Lowest) ==="
-sort -t, -k4,4nr "$CSV_FILE" | awk -F',' 'NR>1 {printf "Instance %s: %s bytes total (IN=%s, OUT=%s)\n", $1, $4, $2, $3}'
+GRAND_TOTAL_BYTES=$(jq 'map(.totalBytes) | add // 0' "$JSON_FILE")
+sort -t, -k4,4nr "$CSV_FILE" | awk -F',' -v grand="$GRAND_TOTAL_BYTES" 'NR>1 {
+    pct = (grand > 0) ? ($4 * 100 / grand) : 0;
+    printf "Instance %s: %s bytes (%.2f MB), IN=%s bytes (%.2f MB), OUT=%s bytes (%.2f MB), %.2f%% of total\n", $1, $4, $7, $2, $5, $3, $6, pct
+}'
 
 SUMMARY=$(jq '
   {
@@ -210,7 +226,11 @@ SUMMARY=$(jq '
         totalInBytes: (map(.networkInBytes) | add // 0),
         totalOutBytes: (map(.networkOutBytes) | add // 0),
         totalBytes: (map(.totalBytes) | add // 0),
+        totalInMB: (map(.networkInMB) | add // 0),
+        totalOutMB: (map(.networkOutMB) | add // 0),
+        totalMB: (map(.totalMB) | add // 0),
         averageBytesPerNode: (if length == 0 then 0 else ((map(.totalBytes) | add // 0) / length) end),
+        averageMBPerNode: (if length == 0 then 0 else ((map(.totalMB) | add // 0) / length) end),
         highest: (if length == 0 then null else max_by(.totalBytes) end),
         lowest: (if length == 0 then null else min_by(.totalBytes) end)
   }
