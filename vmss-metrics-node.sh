@@ -19,6 +19,25 @@ bytes_to_mb() {
     jq -nr --argjson b "$bytes" '($b / 1048576)'
 }
 
+offset_to_seconds() {
+    local offset="$1"
+    if [[ "$offset" =~ ^([0-9]+)d$ ]]; then
+        echo "$(( ${BASH_REMATCH[1]} * 86400 ))"
+        return 0
+    fi
+    if [[ "$offset" =~ ^([0-9]+)h$ ]]; then
+        echo "$(( ${BASH_REMATCH[1]} * 3600 ))"
+        return 0
+    fi
+    if [[ "$offset" =~ ^([0-9]+)m$ ]]; then
+        echo "$(( ${BASH_REMATCH[1]} * 60 ))"
+        return 0
+    fi
+
+    echo "Error: Could not convert offset '$offset' to seconds." >&2
+    return 1
+}
+
 safe_exit() {
     local code="${1:-1}"
     # If sourced, return to prompt instead of closing the shell session.
@@ -122,6 +141,10 @@ if ! TIME_RANGE=$(normalize_offset "$TIME_RANGE"); then
     safe_exit 1
 fi
 
+if ! WINDOW_SECONDS=$(offset_to_seconds "$TIME_RANGE"); then
+    safe_exit 1
+fi
+
 # ====== VALIDATION ======
 if ! command -v az >/dev/null 2>&1; then
     echo "Error: Azure CLI (az) is not installed." >&2
@@ -159,7 +182,7 @@ if [[ -z "$INSTANCE_IDS" ]]; then
     safe_exit 1
 fi
 
-echo "instanceId,networkInBytes,networkOutBytes,totalBytes,networkInMB,networkOutMB,totalMB" > "$CSV_FILE"
+echo "instanceId,networkInBytes,networkOutBytes,totalBytes,networkInMB,networkOutMB,totalMB,networkInMBps,networkOutMBps,totalMBps" > "$CSV_FILE"
 
 echo "Collecting network traffic metrics per instance..."
 echo "Window: last $TIME_RANGE | Interval: $INTERVAL"
@@ -193,6 +216,9 @@ for INSTANCE_ID in $INSTANCE_IDS; do
     NET_IN_MB=$(bytes_to_mb "$NET_IN")
     NET_OUT_MB=$(bytes_to_mb "$NET_OUT")
     TOTAL_MB=$(bytes_to_mb "$TOTAL")
+    NET_IN_MBPS=$(jq -nr --argjson mb "$NET_IN_MB" --argjson sec "$WINDOW_SECONDS" 'if $sec > 0 then ($mb / $sec) else 0 end')
+    NET_OUT_MBPS=$(jq -nr --argjson mb "$NET_OUT_MB" --argjson sec "$WINDOW_SECONDS" 'if $sec > 0 then ($mb / $sec) else 0 end')
+    TOTAL_MBPS=$(jq -nr --argjson mb "$TOTAL_MB" --argjson sec "$WINDOW_SECONDS" 'if $sec > 0 then ($mb / $sec) else 0 end')
 
     jq -n \
         --arg instanceId "$INSTANCE_ID" \
@@ -202,10 +228,13 @@ for INSTANCE_ID in $INSTANCE_IDS; do
         --argjson networkInMB "$NET_IN_MB" \
         --argjson networkOutMB "$NET_OUT_MB" \
         --argjson totalMB "$TOTAL_MB" \
-        '{instanceId:$instanceId, networkInBytes:$networkInBytes, networkOutBytes:$networkOutBytes, totalBytes:$totalBytes, networkInMB:$networkInMB, networkOutMB:$networkOutMB, totalMB:$totalMB}' >> "$TMP_FILE"
+        --argjson networkInMBps "$NET_IN_MBPS" \
+        --argjson networkOutMBps "$NET_OUT_MBPS" \
+        --argjson totalMBps "$TOTAL_MBPS" \
+        '{instanceId:$instanceId, networkInBytes:$networkInBytes, networkOutBytes:$networkOutBytes, totalBytes:$totalBytes, networkInMB:$networkInMB, networkOutMB:$networkOutMB, totalMB:$totalMB, networkInMBps:$networkInMBps, networkOutMBps:$networkOutMBps, totalMBps:$totalMBps}' >> "$TMP_FILE"
 
-    printf '%s,%s,%s,%s,%.6f,%.6f,%.6f\n' "$INSTANCE_ID" "$NET_IN" "$NET_OUT" "$TOTAL" "$NET_IN_MB" "$NET_OUT_MB" "$TOTAL_MB" >> "$CSV_FILE"
-    printf 'Instance %s: IN=%s bytes (%.2f MB), OUT=%s bytes (%.2f MB), TOTAL=%s bytes (%.2f MB)\n' "$INSTANCE_ID" "$NET_IN" "$NET_IN_MB" "$NET_OUT" "$NET_OUT_MB" "$TOTAL" "$TOTAL_MB"
+    printf '%s,%s,%s,%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n' "$INSTANCE_ID" "$NET_IN" "$NET_OUT" "$TOTAL" "$NET_IN_MB" "$NET_OUT_MB" "$TOTAL_MB" "$NET_IN_MBPS" "$NET_OUT_MBPS" "$TOTAL_MBPS" >> "$CSV_FILE"
+    printf 'Instance %s: IN=%s bytes (%.2f MB, %.4f MB/s), OUT=%s bytes (%.2f MB, %.4f MB/s), TOTAL=%s bytes (%.2f MB, %.4f MB/s)\n' "$INSTANCE_ID" "$NET_IN" "$NET_IN_MB" "$NET_IN_MBPS" "$NET_OUT" "$NET_OUT_MB" "$NET_OUT_MBPS" "$TOTAL" "$TOTAL_MB" "$TOTAL_MBPS"
 done
 
 if ! jq -s '.' "$TMP_FILE" > "$JSON_FILE"; then
@@ -216,18 +245,15 @@ fi
 echo
 echo "=== Traffic Comparison (Highest to Lowest) ==="
 echo "Window: last $TIME_RANGE | Interval: $INTERVAL"
-GRAND_TOTAL_IN_BYTES=$(jq 'map(.networkInBytes) | add // 0' "$JSON_FILE")
-GRAND_TOTAL_OUT_BYTES=$(jq 'map(.networkOutBytes) | add // 0' "$JSON_FILE")
-sort -t, -k4,4nr "$CSV_FILE" | awk -F',' -v in_total="$GRAND_TOTAL_IN_BYTES" -v out_total="$GRAND_TOTAL_OUT_BYTES" 'NR>1 {
-    in_pct = (in_total > 0) ? ($2 * 100 / in_total) : 0;
-    out_pct = (out_total > 0) ? ($3 * 100 / out_total) : 0;
-    printf "Instance %s: TOTAL=%s bytes (%.2f MB), IN=%s bytes (%.2f MB, %.2f%% of IN), OUT=%s bytes (%.2f MB, %.2f%% of OUT)\n", $1, $4, $7, $2, $5, in_pct, $3, $6, out_pct
+sort -t, -k4,4nr "$CSV_FILE" | awk -F',' 'NR>1 {
+    printf "Instance %s: TOTAL=%s bytes (%.2f MB, %.4f MB/s), IN=%s bytes (%.2f MB, %.4f MB/s), OUT=%s bytes (%.2f MB, %.4f MB/s)\n", $1, $4, $7, $10, $2, $5, $8, $3, $6, $9
 }'
 
 SUMMARY=$(jq '
   {
         interval: $interval,
         timeRange: $timeRange,
+                windowSeconds: $windowSeconds,
     nodeCount: length,
         totalInBytes: (map(.networkInBytes) | add // 0),
         totalOutBytes: (map(.networkOutBytes) | add // 0),
@@ -235,12 +261,15 @@ SUMMARY=$(jq '
         totalInMB: (map(.networkInMB) | add // 0),
         totalOutMB: (map(.networkOutMB) | add // 0),
         totalMB: (map(.totalMB) | add // 0),
+                totalInMBps: (if $windowSeconds == 0 then 0 else ((map(.networkInMB) | add // 0) / $windowSeconds) end),
+                totalOutMBps: (if $windowSeconds == 0 then 0 else ((map(.networkOutMB) | add // 0) / $windowSeconds) end),
+                totalMBps: (if $windowSeconds == 0 then 0 else ((map(.totalMB) | add // 0) / $windowSeconds) end),
         averageBytesPerNode: (if length == 0 then 0 else ((map(.totalBytes) | add // 0) / length) end),
         averageMBPerNode: (if length == 0 then 0 else ((map(.totalMB) | add // 0) / length) end),
         highest: (if length == 0 then null else max_by(.totalBytes) end),
         lowest: (if length == 0 then null else min_by(.totalBytes) end)
   }
-' --arg interval "$INTERVAL" --arg timeRange "$TIME_RANGE" "$JSON_FILE")
+' --arg interval "$INTERVAL" --arg timeRange "$TIME_RANGE" --argjson windowSeconds "$WINDOW_SECONDS" "$JSON_FILE")
 
 echo
 echo "=== Summary ==="
