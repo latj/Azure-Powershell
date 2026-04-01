@@ -162,6 +162,7 @@ fi
 echo "instanceId,networkInBytes,networkOutBytes,totalBytes,networkInMB,networkOutMB,totalMB" > "$CSV_FILE"
 
 echo "Collecting network traffic metrics per instance..."
+echo "Window: last $TIME_RANGE | Interval: $INTERVAL"
 for INSTANCE_ID in $INSTANCE_IDS; do
     RESOURCE_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Compute/virtualMachineScaleSets/$VMSS_NAME/virtualMachines/$INSTANCE_ID"
 
@@ -214,14 +215,19 @@ fi
 
 echo
 echo "=== Traffic Comparison (Highest to Lowest) ==="
-GRAND_TOTAL_BYTES=$(jq 'map(.totalBytes) | add // 0' "$JSON_FILE")
-sort -t, -k4,4nr "$CSV_FILE" | awk -F',' -v grand="$GRAND_TOTAL_BYTES" 'NR>1 {
-    pct = (grand > 0) ? ($4 * 100 / grand) : 0;
-    printf "Instance %s: %s bytes (%.2f MB), IN=%s bytes (%.2f MB), OUT=%s bytes (%.2f MB), %.2f%% of total\n", $1, $4, $7, $2, $5, $3, $6, pct
+echo "Window: last $TIME_RANGE | Interval: $INTERVAL"
+GRAND_TOTAL_IN_BYTES=$(jq 'map(.networkInBytes) | add // 0' "$JSON_FILE")
+GRAND_TOTAL_OUT_BYTES=$(jq 'map(.networkOutBytes) | add // 0' "$JSON_FILE")
+sort -t, -k4,4nr "$CSV_FILE" | awk -F',' -v in_total="$GRAND_TOTAL_IN_BYTES" -v out_total="$GRAND_TOTAL_OUT_BYTES" 'NR>1 {
+    in_pct = (in_total > 0) ? ($2 * 100 / in_total) : 0;
+    out_pct = (out_total > 0) ? ($3 * 100 / out_total) : 0;
+    printf "Instance %s: TOTAL=%s bytes (%.2f MB), IN=%s bytes (%.2f MB, %.2f%% of IN), OUT=%s bytes (%.2f MB, %.2f%% of OUT)\n", $1, $4, $7, $2, $5, in_pct, $3, $6, out_pct
 }'
 
 SUMMARY=$(jq '
   {
+        interval: $interval,
+        timeRange: $timeRange,
     nodeCount: length,
         totalInBytes: (map(.networkInBytes) | add // 0),
         totalOutBytes: (map(.networkOutBytes) | add // 0),
@@ -234,7 +240,7 @@ SUMMARY=$(jq '
         highest: (if length == 0 then null else max_by(.totalBytes) end),
         lowest: (if length == 0 then null else min_by(.totalBytes) end)
   }
-' "$JSON_FILE")
+' --arg interval "$INTERVAL" --arg timeRange "$TIME_RANGE" "$JSON_FILE")
 
 echo
 echo "=== Summary ==="
