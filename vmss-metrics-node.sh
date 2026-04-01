@@ -245,7 +245,7 @@ fi
 echo
 echo "=== Traffic Comparison (Highest to Lowest) ==="
 echo "Window: last $TIME_RANGE | Interval: $INTERVAL"
-sort -t, -k4,4nr "$CSV_FILE" | awk -F',' 'NR>1 {
+tail -n +2 "$CSV_FILE" | sort -t, -k4,4nr | awk -F',' '{
     printf "Instance %s: TOTAL=%s bytes (%.2f MB, %.4f MB/s), IN=%s bytes (%.2f MB, %.4f MB/s), OUT=%s bytes (%.2f MB, %.4f MB/s)\n", $1, $4, $7, $10, $2, $5, $8, $3, $6, $9
 }'
 
