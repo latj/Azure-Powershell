@@ -4,7 +4,7 @@
 # Purpose: Collect per-node VMSS network metrics, summarize results, and export to CSV/JSON.
 # Requirements: Azure CLI logged in, jq installed. Works in Azure Cloud Shell.
 
-set -euo pipefail
+set -uo pipefail
 
 # ====== DEFAULTS ======
 RESOURCE_GROUP=""
@@ -13,6 +13,15 @@ TIME_RANGE="1h"
 INTERVAL="PT1M"
 OUT_DIR="."
 PREFIX="vmss_metrics"
+
+safe_exit() {
+    local code="${1:-1}"
+    # If sourced, return to prompt instead of closing the shell session.
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return "$code"
+    fi
+    exit "$code"
+}
 
 usage() {
     cat <<'EOF'
@@ -57,7 +66,7 @@ normalize_offset() {
     fi
 
     echo "Error: Invalid time range '$input'. Use values like 1h, 30m, 1d, PT1H, PT30M, or P1D." >&2
-    exit 1
+    return 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -88,12 +97,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         -h|--help)
             usage
-            exit 0
+            safe_exit 0
             ;;
         *)
             echo "Error: Unknown argument '$1'" >&2
             usage
-            exit 1
+            safe_exit 1
             ;;
     esac
 done
@@ -101,25 +110,27 @@ done
 if [[ -z "$RESOURCE_GROUP" || -z "$VMSS_NAME" ]]; then
     echo "Error: --resource-group and --vmss-name are required." >&2
     usage
-    exit 1
+    safe_exit 1
 fi
 
-TIME_RANGE=$(normalize_offset "$TIME_RANGE")
+if ! TIME_RANGE=$(normalize_offset "$TIME_RANGE"); then
+    safe_exit 1
+fi
 
 # ====== VALIDATION ======
 if ! command -v az >/dev/null 2>&1; then
     echo "Error: Azure CLI (az) is not installed." >&2
-    exit 1
+    safe_exit 1
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
     echo "Error: jq is required for JSON parsing." >&2
-    exit 1
+    safe_exit 1
 fi
 
 if ! az account show >/dev/null 2>&1; then
     echo "Error: Not logged into Azure CLI. Run 'az login' first." >&2
-    exit 1
+    safe_exit 1
 fi
 
 mkdir -p "$OUT_DIR"
@@ -140,7 +151,7 @@ INSTANCE_IDS=$(az vmss list-instances \
 
 if [[ -z "$INSTANCE_IDS" ]]; then
     echo "No instances found in VMSS '$VMSS_NAME'."
-    exit 1
+    safe_exit 1
 fi
 
 echo "instanceId,networkInBytes,networkOutBytes,totalBytes" > "$CSV_FILE"
@@ -149,17 +160,29 @@ echo "Collecting network traffic metrics per instance..."
 for INSTANCE_ID in $INSTANCE_IDS; do
     RESOURCE_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Compute/virtualMachineScaleSets/$VMSS_NAME/virtualMachines/$INSTANCE_ID"
 
-    METRICS_JSON=$(az monitor metrics list \
+    if ! METRICS_JSON=$(az monitor metrics list \
         --resource "$RESOURCE_ID" \
         --metrics "Network In Total" "Network Out Total" \
         --interval "$INTERVAL" \
         --aggregation Total \
         --offset "$TIME_RANGE" \
-        -o json)
+        -o json); then
+        echo "Warning: Failed to fetch metrics for instance $INSTANCE_ID. Skipping." >&2
+        continue
+    fi
 
-    NET_IN=$(jq -r '[.value[] | select(.name.value=="Network In Total") | .timeseries[].data[].total // 0] | add // 0' <<< "$METRICS_JSON")
-    NET_OUT=$(jq -r '[.value[] | select(.name.value=="Network Out Total") | .timeseries[].data[].total // 0] | add // 0' <<< "$METRICS_JSON")
-    TOTAL=$(jq -nr --argjson i "$NET_IN" --argjson o "$NET_OUT" '$i + $o')
+    if ! NET_IN=$(jq -r '[.value[] | select(.name.value=="Network In Total") | .timeseries[].data[].total // 0] | add // 0' <<< "$METRICS_JSON"); then
+        echo "Warning: Failed to parse Network In Total for instance $INSTANCE_ID. Skipping." >&2
+        continue
+    fi
+    if ! NET_OUT=$(jq -r '[.value[] | select(.name.value=="Network Out Total") | .timeseries[].data[].total // 0] | add // 0' <<< "$METRICS_JSON"); then
+        echo "Warning: Failed to parse Network Out Total for instance $INSTANCE_ID. Skipping." >&2
+        continue
+    fi
+    if ! TOTAL=$(jq -nr --argjson i "$NET_IN" --argjson o "$NET_OUT" '$i + $o'); then
+        echo "Warning: Failed to calculate totals for instance $INSTANCE_ID. Skipping." >&2
+        continue
+    fi
 
     jq -n \
         --arg instanceId "$INSTANCE_ID" \
@@ -172,21 +195,24 @@ for INSTANCE_ID in $INSTANCE_IDS; do
     echo "Instance $INSTANCE_ID: IN=$NET_IN, OUT=$NET_OUT, TOTAL=$TOTAL bytes"
 done
 
-jq -s '.' "$TMP_FILE" > "$JSON_FILE"
+if ! jq -s '.' "$TMP_FILE" > "$JSON_FILE"; then
+    echo "Error: Failed to write JSON export file." >&2
+    safe_exit 1
+fi
 
 echo
 echo "=== Traffic Comparison (Highest to Lowest) ==="
 sort -t, -k4,4nr "$CSV_FILE" | awk -F',' 'NR>1 {printf "Instance %s: %s bytes total (IN=%s, OUT=%s)\n", $1, $4, $2, $3}'
 
-SUMMARY=$(jq -s '
+SUMMARY=$(jq '
   {
     nodeCount: length,
-    totalInBytes: ([.[].networkInBytes] | add // 0),
-    totalOutBytes: ([.[].networkOutBytes] | add // 0),
-    totalBytes: ([.[].totalBytes] | add // 0),
-    averageBytesPerNode: (if length == 0 then 0 else (([.[].totalBytes] | add // 0) / length) end),
-    highest: (sort_by(.totalBytes) | reverse | .[0]),
-    lowest: (sort_by(.totalBytes) | .[0])
+        totalInBytes: (map(.networkInBytes) | add // 0),
+        totalOutBytes: (map(.networkOutBytes) | add // 0),
+        totalBytes: (map(.totalBytes) | add // 0),
+        averageBytesPerNode: (if length == 0 then 0 else ((map(.totalBytes) | add // 0) / length) end),
+        highest: (if length == 0 then null else max_by(.totalBytes) end),
+        lowest: (if length == 0 then null else min_by(.totalBytes) end)
   }
 ' "$JSON_FILE")
 
